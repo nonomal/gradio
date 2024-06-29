@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -72,8 +73,7 @@ from gradio.utils import (
     TupleNoPrint,
     check_function_inputs_match,
     component_or_layout_class,
-    get_cancel_function,
-    get_continuous_fn,
+    get_cancelled_fn_indices,
     get_package_version,
     get_upload_folder,
 )
@@ -123,13 +123,14 @@ class Block:
         self.proxy_url = proxy_url
         self.share_token = secrets.token_urlsafe(32)
         self.parent: BlockContext | None = None
+        self.rendered_in: Renderable | None = None
         self.is_rendered: bool = False
         self._constructor_args: list[dict]
         self.state_session_capacity = 10000
         self.temp_files: set[str] = set()
         self.GRADIO_CACHE = get_upload_folder()
         self.key = key
-        # Keep tracks of files that should not be deleted when the delete_cache parmaeter is set
+        # Keep tracks of files that should not be deleted when the delete_cache parmameter is set
         # These files are the default value of the component and files that are used in examples
         self.keep_in_cache = set()
 
@@ -166,6 +167,7 @@ class Block:
         """
         root_context = get_blocks_context()
         render_context = get_render_context()
+        self.rendered_in = LocalContext.renderable.get()
         if root_context is not None and self._id in root_context.blocks:
             raise DuplicateBlockError(
                 f"A block with id: {self._id} has already been rendered in the current Blocks."
@@ -233,13 +235,17 @@ class Block:
         for parameter in signature.parameters.values():
             if hasattr(self, parameter.name):
                 value = getattr(self, parameter.name)
-                config[parameter.name] = utils.convert_to_dict_if_dataclass(value)
+                if dataclasses.is_dataclass(value):
+                    value = dataclasses.asdict(value)
+                config[parameter.name] = value
         for e in self.events:
             to_add = e.config_data()
             if to_add:
                 config = {**to_add, **config}
         config.pop("render", None)
         config = {**config, "proxy_url": self.proxy_url, "name": self.get_block_class()}
+        if self.rendered_in is not None:
+            config["rendered_in"] = self.rendered_in._id
         if (_selectable := getattr(self, "_selectable", None)) is not None:
             config["_selectable"] = _selectable
         return config
@@ -468,7 +474,7 @@ class BlockFunction:
         self,
         fn: Callable | None,
         inputs: list[Component],
-        outputs: list[Component],
+        outputs: list[Block] | list[Component],
         preprocess: bool,
         postprocess: bool,
         inputs_as_dict: bool,
@@ -482,7 +488,6 @@ class BlockFunction:
         api_name: str | Literal[False] = False,
         js: str | None = None,
         show_progress: Literal["full", "minimal", "hidden"] = "full",
-        every: float | None = None,
         cancels: list[int] | None = None,
         collects_event_data: bool = False,
         trigger_after: int | None = None,
@@ -514,7 +519,6 @@ class BlockFunction:
         self.api_name = api_name
         self.js = js
         self.show_progress = show_progress
-        self.every = every
         self.cancels = cancels or []
         self.collects_event_data = collects_event_data
         self.trigger_after = trigger_after
@@ -524,22 +528,14 @@ class BlockFunction:
         self.scroll_to_output = False if utils.get_space() else scroll_to_output
         self.show_api = show_api
         self.zero_gpu = hasattr(self.fn, "zerogpu")
-        self.types_continuous = bool(self.every)
-        self.types_generator = (
-            inspect.isgeneratorfunction(self.fn)
-            or inspect.isasyncgenfunction(self.fn)
-            or bool(self.every)
-        )
+        self.types_generator = inspect.isgeneratorfunction(
+            self.fn
+        ) or inspect.isasyncgenfunction(self.fn)
         self.renderable = renderable
         self.rendered_in = rendered_in
 
         # We need to keep track of which events are cancel events
-        # in two places:
-        # 1. So that we can skip postprocessing for cancel events.
-        #   They return event_ids that have been cancelled but there
-        #   are no output components
-        # 2. So that we can place the ProcessCompletedMessage in the
-        #   event stream so that clients can close the stream when necessary
+        # so that the client can call the /cancel route directly
         self.is_cancel_function = is_cancel_function
 
         self.spaces_auto_wrap()
@@ -575,13 +571,12 @@ class BlockFunction:
             "api_name": self.api_name,
             "scroll_to_output": self.scroll_to_output,
             "show_progress": self.show_progress,
-            "every": self.every,
             "batch": self.batch,
             "max_batch_size": self.max_batch_size,
             "cancels": self.cancels,
             "types": {
-                "continuous": self.types_continuous,
                 "generator": self.types_generator,
+                "cancel": self.is_cancel_function,
             },
             "collects_event_data": self.collects_event_data,
             "trigger_after": self.trigger_after,
@@ -658,7 +653,7 @@ class BlocksConfig:
         targets: Sequence[EventListenerMethod],
         fn: Callable | None,
         inputs: Component | list[Component] | set[Component] | None,
-        outputs: Component | list[Component] | None,
+        outputs: Block | list[Block] | list[Component] | None,
         preprocess: bool = True,
         postprocess: bool = True,
         scroll_to_output: bool = False,
@@ -670,7 +665,6 @@ class BlocksConfig:
         batch: bool = False,
         max_batch_size: int = 4,
         cancels: list[int] | None = None,
-        every: float | None = None,
         collects_event_data: bool | None = None,
         trigger_after: int | None = None,
         trigger_only_on_success: bool = False,
@@ -699,7 +693,6 @@ class BlocksConfig:
             batch: whether this function takes in a batch of inputs
             max_batch_size: the maximum batch size to send to the function
             cancels: a list of other events to cancel when this event is triggered. For example, setting cancels=[click_event] will cancel the click_event, where click_event is the return value of another components .click method.
-            every: Run this event 'every' number of seconds while the client connection is open. Interpreted in seconds.
             collects_event_data: whether to collect event data for this event
             trigger_after: if set, this event will be triggered after 'trigger_after' function index
             trigger_only_on_success: if True, this event will only be triggered if the previous event was successful (only applies if `trigger_after` is set)
@@ -737,25 +730,6 @@ class BlocksConfig:
 
         if fn is not None and not cancels:
             check_function_inputs_match(fn, inputs, inputs_as_dict)
-        if every is not None and every <= 0:
-            raise ValueError("Parameter every must be positive or None")
-        if every and batch:
-            raise ValueError(
-                f"Cannot run event in a batch and every {every} seconds. "
-                "Either batch is True or every is non-zero but not both."
-            )
-
-        if every and fn:
-            fn = get_continuous_fn(fn, every)
-        elif every:
-            raise ValueError("Cannot set a value for `every` without a `fn`.")
-        if every and concurrency_limit is not None:
-            if concurrency_limit == "default":
-                concurrency_limit = None
-            else:
-                raise ValueError(
-                    "Cannot set a value for `concurrency_limit` with `every`."
-                )
 
         if _targets[0][1] in ["change", "key_up"] and trigger_mode is None:
             trigger_mode = "always_last"
@@ -827,7 +801,6 @@ class BlocksConfig:
             api_name=api_name,
             js=js,
             show_progress=show_progress,
-            every=every,
             cancels=cancels,
             collects_event_data=collects_event_data,
             trigger_after=trigger_after,
@@ -860,7 +833,7 @@ class BlocksConfig:
             return {"id": block._id, "children": children_layout}
 
         if renderable:
-            root_block = self.blocks[renderable.column_id]
+            root_block = self.blocks[renderable.container_id]
         else:
             root_block = self.root_block
         config["layout"] = get_layout(root_block)
@@ -896,7 +869,6 @@ class BlocksConfig:
             if renderable is None or fn.rendered_in == renderable:
                 dependencies.append(fn.get_config())
         config["dependencies"] = dependencies
-
         return config
 
     def __copy__(self):
@@ -986,6 +958,10 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
         self.theme: Theme = theme
         self.theme_css = theme._get_theme_css()
         self.stylesheets = theme._stylesheets
+        theme_hasher = hashlib.sha256()
+        theme_hasher.update(self.theme_css.encode("utf-8"))
+        self.theme_hash = theme_hasher.hexdigest()
+
         self.encrypt = False
         self.share = False
         self.enable_queue = True
@@ -1175,7 +1151,7 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
 
         with Blocks(theme=theme) as blocks:
             # ID 0 should be the root Blocks component
-            original_mapping[0] = Context.root_block or blocks
+            original_mapping[0] = root_block = Context.root_block or blocks
 
             iterate_over_children(config["layout"]["children"])
 
@@ -1250,7 +1226,7 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
                         )
                         for t in targets
                     ]
-                dependency = blocks.default_config.set_event_trigger(
+                dependency = root_block.default_config.set_event_trigger(
                     targets=targets, fn=fn, **dependency
                 )[0]
                 if first_dependency is None:
@@ -1320,7 +1296,6 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
             batch=False,
             max_batch_size=4,
             cancels=None,
-            every=None,
             collects_event_data=None,
             trigger_after=None,
             trigger_only_on_success=False,
@@ -1346,13 +1321,14 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
                     )
 
             root_context.blocks.update(self.blocks)
-            dependency_offset = len(root_context.fns)
+            dependency_offset = max(root_context.fns.keys(), default=-1) + 1
             existing_api_names = [
                 dep.api_name
                 for dep in root_context.fns.values()
                 if isinstance(dep.api_name, str)
             ]
             for dependency in self.fns.values():
+                dependency._id += dependency_offset
                 api_name = dependency.api_name
                 if isinstance(api_name, str):
                     api_name_ = utils.append_unique_suffix(
@@ -1371,9 +1347,9 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
                     updated_cancels = [
                         root_context.fns[i].get_config() for i in dependency.cancels
                     ]
-                    dependency.fn = get_cancel_function(updated_cancels)[0]
-                root_context.fns[root_context.fn_id] = dependency
-                root_context.fn_id += 1
+                    dependency.cancels = get_cancelled_fn_indices(updated_cancels)
+                root_context.fns[dependency._id] = dependency
+            root_context.fn_id = max(root_context.fns.keys(), default=-1) + 1
             Context.root_block.temp_file_sets.extend(self.temp_file_sets)
             Context.root_block.proxy_urls.update(self.proxy_urls)
 
@@ -1688,16 +1664,8 @@ Received outputs:
         block_fn: BlockFunction,
         predictions: list | dict,
         state: SessionState | None,
-    ) -> Any:
+    ) -> list[Any]:
         state = state or SessionState(self)
-
-        # If the function is a cancel function, 'predictions' are the ids of
-        # the event in the queue that has been cancelled. We need these
-        # so that the server can put the ProcessCompleted message in the event stream
-        # Cancel events have no output components, so we need to return early otherise the output
-        # be None.
-        if block_fn.is_cancel_function:
-            return predictions
 
         if isinstance(predictions, dict) and len(predictions) > 0:
             predictions = convert_component_dict_to_list(
@@ -1712,7 +1680,6 @@ Received outputs:
         self.validate_outputs(block_fn, predictions)  # type: ignore
 
         output = []
-        changed_state_ids = []
         for i, block in enumerate(block_fn.outputs):
             try:
                 if predictions[i] is components._Keywords.FINISHED_ITERATING:
@@ -1725,14 +1692,12 @@ Received outputs:
                 ) from err
 
             if block.stateful:
-                if not utils.is_update(predictions[i]):
-                    if block._id not in state or state[block._id] != predictions[i]:
-                        changed_state_ids.append(block._id)
+                if not utils.is_prop_update(predictions[i]):
                     state[block._id] = predictions[i]
                 output.append(None)
             else:
                 prediction_value = predictions[i]
-                if utils.is_update(
+                if utils.is_prop_update(
                     prediction_value
                 ):  # if update is passed directly (deprecated), remove Nones
                     prediction_value = utils.delete_none(
@@ -1742,7 +1707,7 @@ Received outputs:
                 if isinstance(prediction_value, Block):
                     prediction_value = prediction_value.constructor_args.copy()
                     prediction_value["__type__"] = "update"
-                if utils.is_update(prediction_value):
+                if utils.is_prop_update(prediction_value):
                     kwargs = state[block._id].constructor_args.copy()
                     kwargs.update(prediction_value)
                     kwargs.pop("value", None)
@@ -1771,7 +1736,7 @@ Received outputs:
                 )
                 output.append(outputs_cached)
 
-        return output, changed_state_ids
+        return output
 
     async def handle_streaming_outputs(
         self,
@@ -1878,6 +1843,8 @@ Received outputs:
         if isinstance(block_fn, int):
             block_fn = self.fns[block_fn]
         batch = block_fn.batch
+        state_ids_to_track, hashed_values = self.get_state_ids_to_track(block_fn, state)
+        changed_state_ids = []
 
         if batch:
             max_batch_size = block_fn.max_batch_size
@@ -1910,13 +1877,12 @@ Received outputs:
                 state,
             )
             preds = result["prediction"]
-            data_and_changed_state_ids = [
+            data = [
                 await self.postprocess_data(block_fn, list(o), state)
                 for o in zip(*preds)
             ]
-            data, changed_state_ids = zip(*data_and_changed_state_ids)
             if root_path is not None:
-                data = processing_utils.add_root_url(data, root_path, None)
+                data = processing_utils.add_root_url(data, root_path, None)  # type: ignore
             data = list(zip(*data))
             is_generating, iterator = None, None
         else:
@@ -1938,9 +1904,14 @@ Received outputs:
                 in_event_listener,
                 state,
             )
-            data, changed_state_ids = await self.postprocess_data(
-                block_fn, result["prediction"], state
-            )
+            data = await self.postprocess_data(block_fn, result["prediction"], state)
+            if state:
+                changed_state_ids = [
+                    state_id
+                    for hash_value, state_id in zip(hashed_values, state_ids_to_track)
+                    if hash_value != utils.deep_hash(state[state_id])
+                ]
+
             if root_path is not None:
                 data = processing_utils.add_root_url(data, root_path, None)
             is_generating, iterator = result["is_generating"], result["iterator"]
@@ -1980,6 +1951,22 @@ Received outputs:
             output["render_config"]["render_id"] = block_fn.renderable._id
 
         return output
+
+    def get_state_ids_to_track(
+        self, block_fn: BlockFunction, state: SessionState | None
+    ) -> tuple[list[int], list]:
+        if state is None:
+            return [], []
+        state_ids_to_track = []
+        hashed_values = []
+        for block in block_fn.outputs:
+            if block.stateful and any(
+                (block._id, "change") in fn.targets for fn in self.fns.values()
+            ):
+                value = state[block._id]
+                state_ids_to_track.append(block._id)
+                hashed_values.append(utils.deep_hash(value))
+        return state_ids_to_track, hashed_values
 
     def create_limiter(self):
         self.limiter = (
@@ -2026,20 +2013,12 @@ Received outputs:
                 ),
             },
             "fill_height": self.fill_height,
+            "theme_hash": self.theme_hash,
         }
         config.update(self.default_config.get_config())
-        any_state = any(
-            isinstance(block, components.State) for block in self.blocks.values()
+        config["connect_heartbeat"] = utils.connect_heartbeat(
+            config, self.blocks.values()
         )
-        any_unload = False
-        for dep in config["dependencies"]:
-            for target in dep["targets"]:
-                if isinstance(target, (list, tuple)) and len(target) == 2:
-                    any_unload = target[1] == "unload"
-                    if any_unload:
-                        break
-        config["connect_heartbeat"] = any_state or any_unload
-
         return config
 
     def __enter__(self):
@@ -2174,6 +2153,7 @@ Received outputs:
         auth_dependency: Callable[[fastapi.Request], str | None] | None = None,
         max_file_size: str | int | None = None,
         _frontend: bool = True,
+        enable_monitoring: bool = False,
     ) -> tuple[FastAPI, str, str]:
         """
         Launches a simple web server that serves the demo. Can also be used to create a
@@ -2392,6 +2372,11 @@ Received outputs:
                     self.share = True
         else:
             self.share = share
+
+        if enable_monitoring:
+            print(
+                f"Monitoring URL: {self.local_url}monitoring/{self.app.analytics_key}"
+            )
 
         # If running in a colab or not able to access localhost,
         # a shareable link must be created.
@@ -2617,7 +2602,7 @@ Received outputs:
         try:
             if wasm_utils.IS_WASM:
                 # NOTE:
-                # Normally, queue-related async tasks (e.g. continuous events created by `gr.Blocks.load(..., every=interval)`, whose async tasks are started at the `/queue/data` endpoint function)
+                # Normally, queue-related async tasks whose async tasks are started at the `/queue/data` endpoint function)
                 # are running in an event loop in the server thread,
                 # so they will be cancelled by `self.server.close()` below.
                 # However, in the Wasm env, we don't have the `server` and
@@ -2662,21 +2647,18 @@ Received outputs:
                     isinstance(component, components.Component)
                     and component.load_event_to_attach
                 ):
-                    load_fn, every = component.load_event_to_attach
+                    load_fn, triggers, inputs = component.load_event_to_attach
+                    has_target = len(triggers) > 0
+                    triggers += [(self, "load")]
                     # Use set_event_trigger to avoid ambiguity between load class/instance method
 
                     dep = self.default_config.set_event_trigger(
-                        [EventListenerMethod(self, "load")],
+                        [EventListenerMethod(*trigger) for trigger in triggers],
                         load_fn,
-                        None,
+                        inputs,
                         component,
-                        no_target=True,
-                        # If every is None, for sure skip the queue
-                        # else, let the enable_queue parameter take precedence
-                        # this will raise a nice error message is every is used
-                        # without queue
-                        queue=every is not None,
-                        every=every,
+                        no_target=not has_target,
+                        show_progress="hidden" if has_target else "full",
                     )[0]
                     component.load_event = dep.get_config()
 
