@@ -1,147 +1,273 @@
 <script lang="ts">
 	import { onMount } from "svelte";
-	import * as BABYLON from "babylonjs";
-	import * as BABYLON_LOADERS from "babylonjs-loaders";
 	import type { FileData } from "@gradio/client";
-	import { resolve_wasm_src } from "@gradio/wasm/svelte";
+	import type { Viewer, ViewerDetails } from "@babylonjs/viewer";
+	import { has_drawable_geometry, resolve_obj_point_cloud } from "./obj.js";
 
-	$: {
-		if (
-			BABYLON_LOADERS.OBJFileLoader != undefined &&
-			!BABYLON_LOADERS.OBJFileLoader.IMPORT_VERTEX_COLORS
-		) {
-			BABYLON_LOADERS.OBJFileLoader.IMPORT_VERTEX_COLORS = true;
+	let BABYLON_VIEWER: typeof import("@babylonjs/viewer");
+
+	const LOAD_OPTIONS = {
+		pluginOptions: {
+			obj: {
+				importVertexColors: true
+			}
 		}
-	}
+	};
 
-	export let value: FileData;
-	export let clear_color: [number, number, number, number];
-	export let camera_position: [number | null, number | null, number | null];
-	export let zoom_speed: number;
-	export let pan_speed: number;
+	let {
+		value,
+		display_mode,
+		clear_color,
+		camera_position,
+		zoom_speed,
+		pan_speed,
+		data,
+		oncamera_position
+	}: {
+		value: FileData;
+		display_mode: "solid" | "point_cloud" | "wireframe";
+		clear_color: [number, number, number, number];
+		camera_position: [number | null, number | null, number | null];
+		zoom_speed: number;
+		pan_speed: number;
+		/** Already-decoded bytes to load instead of fetching `value.url`. */
+		data?: Uint8Array<ArrayBuffer>;
+		oncamera_position?: (camera_position: [number, number, number]) => void;
+	} = $props();
 
-	$: url = value.url;
+	let url = $derived(value.url);
 
-	/* URL resolution for the Wasm mode. */
-	export let resolved_url: typeof url = undefined; // Exposed to be bound to the download link in the parent component.
-	// The prop can be updated before the Promise from `resolve_wasm_src` is resolved.
-	// In such a case, the resolved url for the old `url` has to be discarded,
-	// This variable `latest_url` is used to pick up only the value resolved for the latest `url`.
-	let latest_url: typeof url;
-	$: {
-		// In normal (non-Wasm) Gradio, the original `url` should be used immediately
-		// without waiting for `resolve_wasm_src()` to resolve.
-		// If it waits, a blank element is displayed until the async task finishes
-		// and it leads to undesirable flickering.
-		// So set `resolved_url` immediately above, and update it with the resolved values below later.
-		resolved_url = url;
-
-		if (url) {
-			latest_url = url;
-			const resolving_url = url;
-			resolve_wasm_src(url).then((resolved) => {
-				if (latest_url === resolving_url) {
-					resolved_url = resolved ?? undefined;
-				} else {
-					resolved && URL.revokeObjectURL(resolved);
-				}
-			});
-		}
-	}
-
-	/* BabylonJS engine and scene management */
 	let canvas: HTMLCanvasElement;
-	let scene: BABYLON.Scene;
-	let engine: BABYLON.Engine;
-	let mounted = false;
+	let viewer = $state<Viewer>();
+	let viewerDetails = $state<Readonly<ViewerDetails>>();
+	let mounted = $state(false);
+
+	let load_generation = 0;
+	let initialized_generation = -1;
+
+	let settled_radians: [number, number, number] | null = null;
+	let settled_degrees: [number, number, number] | null = null;
+	let configured_position: [number | null, number | null, number | null] =
+		camera_position;
 
 	onMount(() => {
-		// Initialize BabylonJS engine and scene
-		engine = new BABYLON.Engine(canvas, true);
-		scene = new BABYLON.Scene(engine);
+		let active = true;
 
-		scene.createDefaultCameraOrLight();
-		scene.clearColor = scene.clearColor = new BABYLON.Color4(...clear_color);
+		const initViewer = async (): Promise<void> => {
+			BABYLON_VIEWER = await import("@babylonjs/viewer");
+			const promiseViewer = await BABYLON_VIEWER.CreateViewerForCanvas(canvas, {
+				clearColor: clear_color,
+				useRightHandedSystem: true,
+				animationAutoPlay: true,
+				cameraAutoOrbit: { enabled: false },
+				onInitialized: (details: any) => {
+					viewerDetails = details;
+				}
+			});
 
-		engine.runRenderLoop(() => {
-			scene.render();
-		});
+			if (!active) {
+				promiseViewer.dispose();
+				return;
+			}
 
-		function onWindowResize(): void {
-			engine.resize();
-		}
-		window.addEventListener("resize", onWindowResize);
+			viewer = promiseViewer;
+			mounted = true;
+		};
 
-		mounted = true;
+		void initViewer();
 
 		return () => {
-			scene.dispose();
-			engine.dispose();
-			window.removeEventListener("resize", onWindowResize);
+			active = false;
+			mounted = false;
+			viewer?.dispose();
+			viewer = undefined;
 		};
 	});
 
-	$: mounted && load_model(resolved_url);
+	$effect(() => {
+		if (mounted) {
+			// Babylon picks its loader from the filename, so decoded bytes are
+			// handed over as a named file rather than a bare buffer.
+			void load_model(data ? new File([data], "model.ply") : url);
+		}
+	});
 
-	function load_model(url: string | undefined): void {
-		if (scene) {
-			// Dispose of the previous model before loading a new one
-			scene.meshes.forEach((mesh) => {
-				mesh.dispose();
-			});
+	function setRenderingMode(pointsCloud: boolean, wireframe: boolean): void {
+		if (!viewerDetails) return;
+		viewerDetails.scene.forcePointsCloud = pointsCloud;
+		viewerDetails.scene.forceWireframe = wireframe;
+	}
 
-			// Load the new model
-			if (url) {
-				BABYLON.SceneLoader.ShowLoadingScreen = false;
-				BABYLON.SceneLoader.Append(
-					url,
-					"",
-					scene,
-					() => create_camera(scene, camera_position, zoom_speed, pan_speed),
-					undefined,
-					undefined,
-					"." + value.path.split(".").pop()
-				);
+	async function load_model(source: string | File | undefined): Promise<void> {
+		const currentViewer = viewer;
+		if (!currentViewer) return;
+
+		const generation = ++load_generation;
+
+		if (source) {
+			try {
+				await currentViewer.loadModel(source, LOAD_OPTIONS);
+				if (mounted && currentViewer === viewer) {
+					await load_as_point_cloud(currentViewer, source);
+				}
+			} catch (error) {
+				if (mounted && currentViewer === viewer) {
+					console.error(error);
+				}
+				return;
 			}
+
+			if (!mounted || currentViewer !== viewer) return;
+			if (generation !== load_generation) return;
+
+			if (display_mode === "point_cloud") {
+				setRenderingMode(true, false);
+			} else if (display_mode === "wireframe") {
+				setRenderingMode(false, true);
+			}
+			settled_radians = null;
+			settled_degrees = null;
+			initialized_generation = generation;
+			apply_camera(configured_position, false);
+		} else {
+			settled_radians = null;
+			settled_degrees = null;
+			currentViewer.resetModel();
 		}
 	}
 
-	function create_camera(
-		scene: BABYLON.Scene,
-		camera_position: [number | null, number | null, number | null],
-		zoom_speed: number,
-		pan_speed: number
-	): void {
-		scene.createDefaultCamera(true, true, true);
-		var helperCamera = scene.activeCamera! as BABYLON.ArcRotateCamera;
-		if (camera_position[0] !== null) {
-			helperCamera.alpha = BABYLON.Tools.ToRadians(camera_position[0]);
-		}
-		if (camera_position[1] !== null) {
-			helperCamera.beta = BABYLON.Tools.ToRadians(camera_position[1]);
-		}
-		if (camera_position[2] !== null) {
-			helperCamera.radius = camera_position[2];
-		}
-		helperCamera.lowerRadiusLimit = 0.1;
-		const updateCameraSensibility = (): void => {
-			helperCamera.wheelPrecision = 250 / (helperCamera.radius * zoom_speed);
-			helperCamera.panningSensibility =
-				(10000 * pan_speed) / helperCamera.radius;
-		};
-		updateCameraSensibility();
-		helperCamera.attachControl(true);
-		helperCamera.onAfterCheckInputsObservable.add(updateCameraSensibility);
+	/**
+	 * A face-less OBJ can load without error and leave nothing to draw, so it is
+	 * reloaded as a point cloud. See obj.ts.
+	 */
+	async function load_as_point_cloud(
+		currentViewer: Viewer,
+		source: string | File
+	): Promise<void> {
+		if (typeof source !== "string") return;
+		if (!value.path.toLowerCase().endsWith(".obj")) return;
+
+		const meshes = viewerDetails?.model?.assetContainer.meshes ?? [];
+		if (has_drawable_geometry(meshes)) return;
+
+		const points = await resolve_obj_point_cloud(source);
+		// `value` can change while the file is in flight. Babylon aborts an
+		// in-flight load on the next one, so loading here would undo the newer
+		// model rather than the other way round.
+		if (!points || !mounted || currentViewer !== viewer || source !== url)
+			return;
+		await currentViewer.loadModel(
+			new File([points], "model.ply"),
+			LOAD_OPTIONS
+		);
 	}
 
-	export function reset_camera_position(
-		camera_position: [number | null, number | null, number | null],
-		zoom_speed: number,
-		pan_speed: number
+	function to_radians(degrees: number): number {
+		return (degrees * Math.PI) / 180;
+	}
+
+	function to_degrees(radians: number): number {
+		return (radians * 180) / Math.PI;
+	}
+
+	function same_position(
+		a: [number, number, number],
+		b: [number | null, number | null, number | null]
+	): boolean {
+		return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+	}
+
+	export function update_camera(): void {
+		const is_echo =
+			settled_degrees !== null &&
+			same_position(settled_degrees, camera_position);
+		if (!is_echo) configured_position = camera_position;
+		apply_camera(camera_position, is_echo);
+	}
+
+	function apply_camera(
+		position: [number | null, number | null, number | null],
+		is_echo: boolean
 	): void {
-		if (scene) {
-			scene.removeCamera(scene.activeCamera!);
-			create_camera(scene, camera_position, zoom_speed, pan_speed);
+		if (!viewerDetails) return;
+		const camera = viewerDetails.camera;
+
+		if (!is_echo) {
+			if (position[0] !== null) {
+				camera.alpha = to_radians(position[0]);
+			}
+			if (position[1] !== null) {
+				camera.beta = to_radians(position[1]);
+			}
+			if (position[2] !== null) {
+				camera.radius = position[2];
+			}
+			settled_degrees = [
+				position[0] ?? to_degrees(camera.alpha),
+				position[1] ?? to_degrees(camera.beta),
+				position[2] ?? camera.radius
+			];
+			settled_radians = [camera.alpha, camera.beta, camera.radius];
+		}
+
+		camera.lowerRadiusLimit = 0.1;
+		update_camera_sensibility();
+
+		if (!is_echo && settled_degrees) {
+			report_camera_position(settled_degrees);
+		}
+	}
+
+	function update_camera_sensibility(): void {
+		if (!viewerDetails) return;
+		const camera = viewerDetails.camera;
+		camera.wheelPrecision = 250 / (camera.radius * zoom_speed);
+		camera.panningSensibility = (10000 * pan_speed) / camera.radius;
+	}
+
+	function report_camera_position(
+		camera_position: [number, number, number]
+	): void {
+		if (initialized_generation !== load_generation) return;
+		oncamera_position?.(camera_position);
+	}
+
+	function unmoved_degrees(index: 0 | 1, radians: number): number | null {
+		if (!settled_radians || !settled_degrees) return null;
+		return settled_radians[index] === radians ? settled_degrees[index] : null;
+	}
+
+	function update_camera_position(): void {
+		if (!viewerDetails) return;
+		const camera = viewerDetails.camera;
+		const radians: [number, number, number] = [
+			camera.alpha,
+			camera.beta,
+			camera.radius
+		];
+		if (settled_radians && same_position(radians, settled_radians)) return;
+		settled_degrees = [
+			unmoved_degrees(0, camera.alpha) ?? to_degrees(camera.alpha),
+			unmoved_degrees(1, camera.beta) ?? to_degrees(camera.beta),
+			camera.radius
+		];
+		settled_radians = radians;
+		report_camera_position(settled_degrees);
+	}
+
+	$effect(() => {
+		if (!viewerDetails) return;
+		const camera = viewerDetails.camera;
+		const observer = camera.onAfterCheckInputsObservable.add(() => {
+			update_camera_sensibility();
+			update_camera_position();
+		});
+		return () => camera.onAfterCheckInputsObservable.remove(observer);
+	});
+
+	export function reset_camera_position(): void {
+		if (viewerDetails && viewer) {
+			viewer.resetCamera();
 		}
 	}
 </script>

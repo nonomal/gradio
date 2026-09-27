@@ -20,16 +20,13 @@ export const process_audio = async (
 	end?: number,
 	waveform_sample_rate?: number
 ): Promise<Uint8Array> => {
-	const audioContext = new AudioContext({
-		sampleRate: waveform_sample_rate || audioBuffer.sampleRate
-	});
 	const numberOfChannels = audioBuffer.numberOfChannels;
 	const sampleRate = waveform_sample_rate || audioBuffer.sampleRate;
+	const audioContext = new OfflineAudioContext(1, 1, sampleRate);
 
 	let trimmedLength = audioBuffer.length;
 	let startOffset = 0;
-
-	if (start && end) {
+	if (start != null && end != null) {
 		startOffset = Math.round(start * sampleRate);
 		const endOffset = Math.round(end * sampleRate);
 		trimmedLength = endOffset - startOffset;

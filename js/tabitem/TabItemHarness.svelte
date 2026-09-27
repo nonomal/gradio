@@ -1,0 +1,40 @@
+<script lang="ts">
+	import { setContext } from "svelte";
+	import { writable } from "svelte/store";
+	import { TABS } from "@gradio/tabs";
+	import { BaseTabItem } from "./Index.svelte";
+
+	let all = $props();
+	const cfg = (all as any).props ?? {};
+
+	const selected_tab = writable<string | number | false>(
+		cfg.tab_selected ?? "t1"
+	);
+	const selected_tab_index = writable<number>(cfg.tab_selected_index ?? 0);
+
+	setContext(TABS, {
+		register_tab: (tab: any, order: number) => {
+			cfg.on_register?.(tab);
+			return order;
+		},
+		unregister_tab: () => {},
+		selected_tab,
+		selected_tab_index
+	});
+</script>
+
+<BaseTabItem
+	label="First Tab"
+	id={cfg.omit_id ? undefined : (cfg.tab_id ?? "t1")}
+	order={0}
+	visible={cfg.tab_visible ?? true}
+	interactive={true}
+	alignment={cfg.tab_alignment ?? "left"}
+	scale={0}
+	height={cfg.tab_height}
+	max_height={cfg.tab_max_height}
+	component_id={1}
+	onselect={(data) => cfg.on_tab_select?.(data)}
+>
+	<div data-testid="tab-content">tab panel content</div>
+</BaseTabItem>

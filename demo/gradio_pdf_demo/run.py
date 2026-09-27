@@ -1,5 +1,5 @@
 import gradio as gr
-from gradio_pdf import PDF
+from gradio_pdf import PDF  # type: ignore[unresolved-import]
 from pathlib import Path
 
 current_dir = Path(__file__).parent
@@ -7,7 +7,8 @@ current_dir = Path(__file__).parent
 demo = gr.Interface(lambda x: x,
                     PDF(),
                     gr.File(),
-                    examples=[[str(current_dir / "contract.pdf")]])
+                    examples=[[str(current_dir / "contract.pdf")]],
+                    api_name="predict")
 
 if __name__ == "__main__":
     demo.launch()

@@ -3,33 +3,36 @@ from __future__ import annotations
 import importlib
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any
 
-import requests
+import httpx
 import tomlkit as toml
 from typer import Argument, Option
-from typing_extensions import Annotated
 
 from gradio.analytics import custom_component_analytics
 from gradio.cli.commands.display import LivePanelDisplay
 
 from ._docs_assets import css
-from ._docs_utils import extract_docstrings, get_deep, make_markdown, make_space
+from ._docs_utils import (
+    RUFF_INSTALLED,
+    extract_docstrings,
+    get_deep,
+    make_markdown,
+    make_space,
+)
 
 
 def _docs(
     path: Annotated[
         Path, Argument(help="The directory of the custom component.")
     ] = Path("."),
-    demo_dir: Annotated[
-        Optional[Path], Option(help="Path to the demo directory.")
-    ] = None,
-    demo_name: Annotated[Optional[str], Option(help="Name of the demo file.")] = None,
+    demo_dir: Annotated[Path | None, Option(help="Path to the demo directory.")] = None,
+    demo_name: Annotated[str | None, Option(help="Name of the demo file.")] = None,
     readme_path: Annotated[
-        Optional[Path], Option(help="Path to the README.md file.")
+        Path | None, Option(help="Path to the README.md file.")
     ] = None,
     space_url: Annotated[
-        Optional[str], Option(help="URL of the Space to use for the demo.")
+        str | None, Option(help="URL of the Space to use for the demo.")
     ] = None,
     generate_space: Annotated[
         bool,
@@ -91,6 +94,11 @@ def _docs(
         if not isinstance(name, str):
             raise ValueError("Name not found in pyproject.toml")
 
+        if not RUFF_INSTALLED:
+            live.update(
+                "\n:warning: [yellow]Ruff is not installed. Code snippets will not be formatted. To install, run `pip install ruff`.[/]"
+            )
+
         run_command(
             live=live,
             name=name,
@@ -125,7 +133,7 @@ def run_command(
     with open(_demo_path, encoding="utf-8") as f:
         demo = f.read()
 
-    pypi_exists = requests.get(f"https://pypi.org/pypi/{name}/json").status_code
+    pypi_exists = httpx.get(f"https://pypi.org/pypi/{name}/json").status_code
 
     pypi_exists = pypi_exists == 200 or False
 
@@ -201,5 +209,5 @@ def run_command(
 
     if type_mode == "simple":
         live.update(
-            "\n:orange_circle: [red]The docs were generated in simple mode. Updating python to a version greater than 3.9 will result in richer documentation.[/]"
+            "\n:orange_circle: [red]The docs were generated in simple mode. Updating python to a more recent version will result in richer documentation.[/]"
         )

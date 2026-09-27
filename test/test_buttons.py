@@ -8,7 +8,12 @@ import gradio as gr
 class TestClearButton:
     def test_clear_event_setup_correctly(self):
         with gr.Blocks() as demo:
-            chatbot = gr.Chatbot([["Hello", "How are you?"]])
+            chatbot = gr.Chatbot(  # type: ignore
+                [  # type: ignore
+                    {"content": "Hello", "role": "user"},
+                    {"content": "How are you?", "role": "assistant"},
+                ]
+            )
             with gr.Row():
                 textbox = gr.Textbox(scale=3, interactive=True)
                 gr.ClearButton([textbox, chatbot], scale=1)
@@ -20,7 +25,12 @@ class TestClearButton:
 
     def test_clear_event_setup_correctly_with_state(self):
         with gr.Blocks() as demo:
-            chatbot = gr.Chatbot([["Hello", "How are you?"]])
+            chatbot = gr.Chatbot(  # type: ignore
+                [  # type: ignore
+                    {"content": "Hello", "role": "user"},
+                    {"content": "How are you?", "role": "assistant"},
+                ]
+            )
             state = gr.State("")
             gr.ClearButton([state, chatbot], scale=1)
 
@@ -34,12 +44,6 @@ class TestOAuthButtons:
         with pytest.warns(UserWarning):
             with gr.Blocks():
                 gr.LoginButton()
-
-    @pytest.mark.flaky
-    def test_logout_button_warns_when_not_on_spaces(self):
-        with pytest.warns(UserWarning):
-            with gr.Blocks():
-                gr.LogoutButton()
 
     @patch("gradio.oauth.get_space", lambda: "fake_space")
     @patch("gradio.oauth._add_oauth_routes")

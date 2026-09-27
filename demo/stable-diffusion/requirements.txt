@@ -1,5 +1,2 @@
-diffusers
-transformers
-nvidia-ml-py3
-ftfy
-torch
+diffusers==0.39.0
+torch==2.13.0

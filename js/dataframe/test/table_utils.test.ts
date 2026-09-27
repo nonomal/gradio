@@ -1,0 +1,173 @@
+import { describe, test, expect } from "vitest";
+import {
+	make_cell_id,
+	make_header_id,
+	parse_table_file
+} from "../shared/utils/table_utils";
+import { cast_value_to_type } from "../shared/utils/utils";
+
+describe("table_utils", () => {
+	describe("id generation", () => {
+		test("generates unique cell ids", () => {
+			const id_set = new Set();
+			for (let row = 0; row < 10; row++) {
+				for (let col = 0; col < 10; col++) {
+					id_set.add(make_cell_id(row, col));
+				}
+			}
+			expect(id_set.size).toBe(100);
+		});
+
+		test("generates unique header ids", () => {
+			const id_set = new Set();
+			for (let i = 0; i < 10; i++) {
+				id_set.add(make_header_id(i));
+			}
+			expect(id_set.size).toBe(10);
+		});
+	});
+});
+
+describe("cast_value_to_type", () => {
+	test("casts to number", () => {
+		expect(cast_value_to_type("42", "number")).toBe(42);
+		expect(cast_value_to_type(3.14, "number")).toBe(3.14);
+		expect(cast_value_to_type("not a number", "number")).toBe("not a number");
+	});
+	test("casts to bool", () => {
+		expect(cast_value_to_type("True", "bool")).toBe(true);
+		expect(cast_value_to_type("False", "bool")).toBe(false);
+		expect(cast_value_to_type(1, "bool")).toBe(true);
+		expect(cast_value_to_type(0, "bool")).toBe(false);
+		expect(cast_value_to_type("1", "bool")).toBe(true);
+		expect(cast_value_to_type("0", "bool")).toBe(false);
+		expect(cast_value_to_type("yes", "bool")).toBe("yes");
+		expect(cast_value_to_type("no", "bool")).toBe("no");
+		expect(cast_value_to_type("on", "bool")).toBe("on");
+		expect(cast_value_to_type("off", "bool")).toBe("off");
+		expect(cast_value_to_type("random", "bool")).toBe("random");
+	});
+	test("casts to date", () => {
+		const result = cast_value_to_type("2023-01-01", "date");
+		expect(result).toBe("2023-01-01T00:00:00.000Z");
+		expect(typeof cast_value_to_type("not a date", "date")).toBe("string");
+	});
+	test("returns value as-is for str", () => {
+		expect(cast_value_to_type("hello", "str")).toBe("hello");
+		expect(cast_value_to_type(123, "str")).toBe(123);
+	});
+	test("preserves null and undefined for all types", () => {
+		expect(cast_value_to_type(null, "number")).toBe(null);
+		expect(cast_value_to_type(undefined, "number")).toBe(undefined);
+		expect(cast_value_to_type(null, "bool")).toBe(null);
+		expect(cast_value_to_type(undefined, "bool")).toBe(undefined);
+		expect(cast_value_to_type(null, "date")).toBe(null);
+		expect(cast_value_to_type(undefined, "date")).toBe(undefined);
+		expect(cast_value_to_type(null, "str")).toBe(null);
+		expect(cast_value_to_type(undefined, "str")).toBe(undefined);
+	});
+});
+
+describe("parse_table_file", () => {
+	test("detects a comma-separated file", async () => {
+		const file = new File(["a,b,c\n1,2,3\n4,5,6"], "data.csv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["a", "b", "c"],
+			values: [
+				["1", "2", "3"],
+				["4", "5", "6"]
+			]
+		});
+	});
+
+	test("detects a tab-separated file", async () => {
+		const file = new File(["a\tb\tc\n1\t2\t3\n4\t5\t6"], "data.tsv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["a", "b", "c"],
+			values: [
+				["1", "2", "3"],
+				["4", "5", "6"]
+			]
+		});
+	});
+
+	test("picks the extension's delimiter when both look consistent", async () => {
+		const file = new File(["first,last\tage\nAlice,Smith\t30\n"], "data.tsv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["first,last", "age"],
+			values: [["Alice,Smith", "30"]]
+		});
+	});
+
+	test("reads a mislabeled file by its content", async () => {
+		const file = new File(["name,age\nAlice,30\n"], "data.tsv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["name", "age"],
+			values: [["Alice", "30"]]
+		});
+	});
+
+	// counting raw separators misses this: the quoted comma makes the comma counts
+	// disagree between the two lines, so nothing looks consistent
+	test("reads a mislabeled file whose field holds a quoted comma", async () => {
+		const file = new File(['name,note\nA,"x,y"\n'], "data.tsv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["name", "note"],
+			values: [["A", "x,y"]]
+		});
+	});
+
+	// the extension says comma and the header does split on one, but only the
+	// tab splits every line, so the name loses to the file's own shape
+	test("reads a mislabeled file whose header holds the other separator", async () => {
+		const file = new File(["first,last\tage\nAlice\t30\n"], "data.csv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["first,last", "age"],
+			values: [["Alice", "30"]]
+		});
+	});
+
+	// nothing splits this file consistently, so the separator that at least
+	// splits the header wins and the caller gets to report a useful mismatch
+	test("falls back to the separator that splits the header", async () => {
+		const file = new File(["name,age\nAlice,30,Engineer\n"], "data.tsv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["name", "age"],
+			values: [["Alice", "30", "Engineer"]]
+		});
+	});
+
+	test("ignores blank lines", async () => {
+		const file = new File(["a,b\n1,2\n\n3,4\n\n"], "data.csv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["a", "b"],
+			values: [
+				["1", "2"],
+				["3", "4"]
+			]
+		});
+	});
+
+	test("ignores blank lines in a file with windows line endings", async () => {
+		const file = new File(["a,b\r\n1,2\r\n\r\n"], "data.csv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["a", "b"],
+			values: [["1", "2"]]
+		});
+	});
+
+	// excel writes one in front of its csv export. Blob.text() decodes as UTF-8,
+	// which drops it, so this holds as long as the file is read that way
+	test("strips a byte order mark from the first header", async () => {
+		const file = new File(["﻿name,age\nAlice,30\n"], "data.csv");
+		expect(await parse_table_file(file)).toEqual({
+			headers: ["name", "age"],
+			values: [["Alice", "30"]]
+		});
+	});
+
+	test("returns nothing for a file that holds only whitespace", async () => {
+		const file = new File(["   \n"], "data.csv");
+		expect(await parse_table_file(file)).toEqual({ headers: [], values: [] });
+	});
+});

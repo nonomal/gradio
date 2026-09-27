@@ -1,92 +1,150 @@
-name: "test / functional"
+name: "functional"
 
 on:
-  workflow_run:
-    workflows: ["trigger"]
-    types:
-      - requested
-
-permissions:
-  statuses: write
+  pull_request:
+  push:
+    branches:
+      - main
+      - 5.0-dev
 
 concurrency:
-  group: "${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}-${{ github.workflow_ref }}"
+  group: "${{ github.event.pull_request.number }}-${{ github.ref_name }}-${{ github.workflow }}"
   cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CI: true
+  UV_EXCLUDE_NEWER: 7 days
 
 jobs:
   changes:
+    permissions:
+      contents: read
+      pull-requests: read
     name: "changes"
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.changes.outputs.should_run }}
       sha: ${{ steps.changes.outputs.sha }}
-      merge_sha: ${{ steps.changes.outputs.merge_sha }}
       pr_number: ${{ steps.changes.outputs.pr_number }}
       source_branch: ${{ steps.changes.outputs.source_branch }}
       source_repo: ${{ steps.changes.outputs.source_repo }}
-      mergeable: ${{ steps.changes.outputs.mergeable }}
     steps:
       - uses: actions/checkout@v4
       - uses: "gradio-app/gradio/.github/actions/changes@main"
         id: changes
         with:
-          type: "functional"
+          filter: "functional"
           token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-functional:
-    name: "test-functional"
+  build:
+    name: "build-frontend"
+    permissions:
+      contents: read
+    runs-on: ubuntu-20.04-16core
     needs: changes
     if: needs.changes.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
+      # Build the frontend exactly once and share it with both SSR test legs
+      # (below) via an artifact. Previously each leg rebuilt it independently,
+      # paying the ~3min `pnpm build` twice. This action sets up node/pnpm,
+      # installs deps and builds into `gradio/templates/**` (the SPA + the SSR
+      # server bundle) — no Python/venv needed (the build only reads the
+      # checked-in `gradio/package.json` for the version string).
+      - name: build frontend
+        uses: "gradio-app/gradio/.github/actions/install-frontend-deps@main"
+      - name: upload built frontend templates
+        uses: actions/upload-artifact@v4
         with:
-          ref: ${{ needs.changes.outputs.merge_sha }}
-          repository: ${{ needs.changes.outputs.mergeable == 'true' &&  github.repository || needs.changes.outputs.source_repo }}
+          name: gradio-templates
+          path: gradio/templates
+          retention-days: 1
+          include-hidden-files: true
+  test:
+    # Browser legs keep their original check names (functional-test-SSR=true/
+    # false); reload runs as its own leg named functional-reload.
+    name: "${{ matrix.suite == 'reload' && 'functional-reload' || format('functional-test-SSR={0}', matrix.ssr) }}"
+    permissions:
+      contents: read
+    runs-on: ubuntu-20.04-16core
+    needs: [changes, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Reload tests get their own leg instead of running after the browser
+        # suite inside each SSR leg: the ~99s serial reload run is taken off the
+        # browser legs' critical path. Reload doesn't depend on SSR mode (the
+        # reload step never set GRADIO_SSR_MODE), so it runs once here rather
+        # than redundantly in both legs.
+        include:
+          - { suite: browser, ssr: true }
+          - { suite: browser, ssr: false }
+          - { suite: reload }
+    if: needs.changes.outputs.should_run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      # `skip_build: true` skips the frontend build (we download it from the
+      # `build` job instead). `skip_docs_gen: true` skips website JSON/CSS-var
+      # doc generation (~80s, irrelevant to browser tests); it's a new input on
+      # install-all-deps, so it only takes effect once this PR is merged and the
+      # @main action carries it (the current @main ignores the unknown input).
       - name: install dependencies
         id: install_deps
         uses: "gradio-app/gradio/.github/actions/install-all-deps@main"
         with:
-          always_install_pnpm: true
-          build_lite: true
-      - name: install outbreak_forecast dependencies
+          python_version: "3.10"
+          test: true
+          skip_build: true
+          skip_docs_gen: true
+      - name: download built frontend templates
+        uses: actions/download-artifact@v4
+        with:
+          name: gradio-templates
+          path: gradio/templates
+      - name: verify frontend templates present
         run: |
-          . venv/bin/activate
-          python -m pip install -r demo/outbreak_forecast/requirements.txt
-          python -m pip install -r demo/gradio_pdf_demo/requirements.txt
-      - run: pnpm exec playwright install chromium
+          test -f gradio/templates/frontend/index.html \
+            || { echo "::error::frontend templates missing after artifact download"; ls -laR gradio/templates | head -50; exit 1; }
+          test -d gradio/templates/node/build \
+            || { echo "::error::SSR node build missing after artifact download"; ls -laR gradio/templates | head -50; exit 1; }
+      - name: cache playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+      - name: install playwright
+        timeout-minutes: 3
+        run: pnpm exec playwright install chromium --only-shell
+      - name: build essential packages
+        run: pnpm --filter @gradio/utils --filter @gradio/theme package
       - name: run browser tests
+        if: matrix.suite == 'browser'
+        env:
+          GRADIO_SSR_MODE: ${{ matrix.ssr }}
+          # Each worker runs Chromium and a Gradio app; eight overloads the runner.
+          PW_BROWSER_WORKERS: 4
         run: |
           . venv/bin/activate
-          CI=1 pnpm test:browser
+          pnpm test:browser
       - name: upload screenshots
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && matrix.suite == 'browser'
         with:
-          name: playwright-screenshots
+          name: playwright-screenshots-SSR-${{ matrix.ssr }}
           path: |
             ./test-results
-      - name: run browser component tests
-        run: |
-          . venv/bin/activate
-          pnpm run test:ct
       - name: run reload mode test
+        if: matrix.suite == 'reload'
         run: |
           . venv/bin/activate
           pnpm test:browser:reload
-      - name: Run Lite E2E tests
-        run: |
-          . venv/bin/activate
-          pnpm --filter @gradio/app test:browser:lite
-      - name: do check
-        if: always()
-        uses: "gradio-app/github/actions/commit-status@main"
+      - name: upload reload mode screenshots
+        uses: actions/upload-artifact@v4
+        if: always() && matrix.suite == 'reload'
         with:
-          type: "functional"
-          token: ${{ secrets.GITHUB_TOKEN }}
-          pr: ${{ needs.changes.outputs.pr_number }}
-          sha: ${{ needs.changes.outputs.sha }}
-          name: "test / functional"
-          result: ${{ job.status }}
-          job_id: "test-functional"
+          name: reload-mode-playwright-screenshots
+          path: |
+            ./test-results
